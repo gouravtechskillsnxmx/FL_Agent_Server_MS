@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.responses import JSONResponse
 from openai import OpenAI
 from fastapi import HTTPException
-from openai.error import OpenAIError
+from openai import APIError, APIStatusError, RateLimitError, OpenAIError
 import asyncio
 import os
 
