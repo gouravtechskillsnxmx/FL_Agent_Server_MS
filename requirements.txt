@@ -1,6 +1,33 @@
-fastapi
-uvicorn
-openai>=1.0.0
-pydantic
-redis
-openai.error
+# Core
+fastapi>=0.95.0
+uvicorn[standard]>=0.20.0
+requests>=2.31.0
+httpx>=0.24.0
+python-dotenv>=1.0.0
+
+# OpenAI Python client (1.x)
+openai>=1.0.0,<2.0.0
+
+# Twilio
+twilio>=8.0.0
+
+# AWS S3
+boto3>=1.26.0
+
+# Database / ORM
+SQLAlchemy>=1.4.0
+psycopg2-binary>=2.9.6
+
+# Redis (if used)
+redis>=4.5.0
+rq>=1.13.0
+
+# Multipart form parsing for FastAPI
+python-multipart>=0.0.6
+
+# Extras (audio handling, if used)
+pydub>=0.25.1
+
+# Optional helpful libs
+python-multipart>=0.0.6
+python-multipart==0.0.6
