@@ -1,0 +1,11 @@
+version: "3.8"
+services:
+  agent:
+    build: .
+    environment:
+      - OPENAI_KEY=${OPENAI_KEY}
+      - AGENT_KEY=${AGENT_KEY}
+      - AGENT_MODEL=${AGENT_MODEL:-gpt-5-nano-2025-08-07}
+      - REDIS_URL=${REDIS_URL:-}
+    ports:
+      - "8000:8000"
