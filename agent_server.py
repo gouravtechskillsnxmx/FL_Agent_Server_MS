@@ -10,8 +10,10 @@ from fastapi.responses import JSONResponse
 from openai import OpenAI
 from fastapi import HTTPException
 from openai import APIError, APIStatusError, RateLimitError, OpenAIError
-import asyncio
-import os
+from fastapi import APIRouter
+
+logger = logging.getLogger("agent_server")
+router = APIRouter()
 
 # Optional Redis memory (requires REDIS_URL)
 redis = None
@@ -77,7 +79,12 @@ def health():
 
 
 
-@app.post("/api/reply", response_model=ReplyResponse)
+
+
+# existing helper: check_auth, get_memory, push_memory, ReplyRequest, ReplyResponse, etc.
+# make sure openai_client is instantiated earlier in the module
+
+@router.post("/api/reply", response_model=ReplyResponse)
 async def api_reply(req: ReplyRequest, request: Request, authorization: Optional[str] = Header(None)):
     if not check_auth(authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -96,102 +103,120 @@ async def api_reply(req: ReplyRequest, request: Request, authorization: Optional
     messages.append({"role": "user", "content": user_text})
 
     model = os.environ.get("AGENT_MODEL", "gpt-5-nano-2025-08-07")
-    max_tokens_env = os.environ.get("AGENT_MAX_TOKENS", "512")
-    try:
-        max_completion_tokens = int(max_tokens_env)
-    except Exception:
-        max_completion_tokens = 512
 
-    temperature = float(os.environ.get("AGENT_TEMPERATURE", "0.2"))
+    # Preferred numeric settings (read from env but keep optional)
+    # Note: we will translate AGENT_MAX_TOKENS -> max_completion_tokens for modern models
+    max_tokens_env = os.environ.get("AGENT_MAX_TOKENS")
+    temperature_env = os.environ.get("AGENT_TEMPERATURE")
 
-    try:
-        # run blocking client in executor to avoid blocking event loop
-        loop = asyncio.get_event_loop()
+    # Build base kwargs for OpenAI call
+    base_kwargs = {
+        "model": model,
+        "messages": messages,
+    }
+
+    if max_tokens_env:
         try:
-            resp = await loop.run_in_executor(
-                None,
-                lambda: openai_client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    # use the newer param name expected by modern OpenAI endpoints
-                    max_completion_tokens=max_completion_tokens,
-                    temperature=temperature,
-                ),
-            )
-        except OpenAIError as oe:
-            # If the model/SDK combination still expects `max_tokens` (rare), try fallback once
-            msg = str(oe)
-            logger.warning("OpenAIError on first attempt: %s", msg)
-            # try a fallback call without the newer param (older API)
-            try:
-                resp = await loop.run_in_executor(
-                    None,
-                    lambda: openai_client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        max_tokens=max_completion_tokens,
-                        temperature=temperature,
-                    ),
-                )
-            except OpenAIError as oe2:
-                # log both error messages for diagnosis and re-raise for outer handler
-                logger.exception("OpenAI call failed (fallback attempt also failed): %s | %s", oe, oe2)
-                raise
+            base_kwargs["max_completion_tokens"] = int(max_tokens_env)
+        except ValueError:
+            logger.warning("AGENT_MAX_TOKENS not an int: %s", max_tokens_env)
 
-        # extract text robustly from response (support dict or object shapes)
-        choice_text = None
+    if temperature_env is not None:
+        try:
+            # don't blindly set if empty string
+            base_kwargs["temperature"] = float(temperature_env)
+        except (ValueError, TypeError):
+            logger.warning("AGENT_TEMPERATURE invalid: %s", temperature_env)
 
-        # openai-python may return resource objects or plain dicts depending on version
-        # Try common locations in order of likelihood
-        if hasattr(resp, "choices") and len(resp.choices) > 0:
-            choice = resp.choices[0]
-            # new-style: choice.message.content
-            msg = getattr(choice, "message", None)
-            if msg is not None:
-                choice_text = getattr(msg, "content", None)
-            # older-style: choice.text
-            if not choice_text:
-                choice_text = getattr(choice, "text", None)
-            # delta streaming style
-            if not choice_text:
-                delta = getattr(choice, "delta", None)
-                if isinstance(delta, dict):
-                    choice_text = delta.get("content")
-        elif isinstance(resp, dict):
-            ch = resp.get("choices", [])
-            if ch:
-                c0 = ch[0]
-                if isinstance(c0.get("message"), dict):
-                    choice_text = c0["message"].get("content")
+    # Attempt the request with graceful fallback(s)
+    loop = asyncio.get_event_loop()
+
+    def do_request(kwargs):
+        # wrapper for running the blocking client in a threadpool
+        return openai_client.chat.completions.create(**kwargs)
+
+    # Try sequence: first attempt with base_kwargs; on failure try fallback modifications.
+    attempt = 0
+    last_exc = None
+    max_attempts = 2
+
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            logger.info("Calling OpenAI (attempt %d) model=%s", attempt, model)
+            resp = await loop.run_in_executor(None, lambda: do_request(base_kwargs.copy()))
+            # success — extract message robustly
+            choice_text = None
+            if hasattr(resp, "choices") and len(resp.choices) > 0:
+                choice = resp.choices[0]
+                msg = getattr(choice, "message", None)
+                if msg is not None:
+                    choice_text = getattr(msg, "content", None)
                 else:
-                    choice_text = c0.get("text") or (c0.get("delta") or {}).get("content")
+                    choice_text = getattr(choice, "text", None)
+            elif isinstance(resp, dict):
+                ch = resp.get("choices", [])
+                if ch:
+                    c0 = ch[0]
+                    if "message" in c0:
+                        choice_text = c0["message"].get("content")
+                    else:
+                        choice_text = c0.get("text")
+            if not choice_text:
+                logger.error("No reply from OpenAI (empty choices): %s", str(resp)[:500])
+                raise HTTPException(status_code=502, detail="No reply from agent")
+            # write simple memory (best-effort)
+            try:
+                push_memory(convo_id, f"user: {user_text}")
+                push_memory(convo_id, f"assistant: {choice_text}")
+            except Exception as ex:
+                logger.warning("Memory write failed: %s", ex)
+            # Return result
+            return ReplyResponse(reply=choice_text, model=model, memory_used=bool(memory_items))
 
-        if not choice_text:
-            # Log enough of the response to debug without dumping huge payloads
-            logger.error("No reply from OpenAI. Response (truncated): %s", str(resp)[:2000])
-            raise HTTPException(status_code=502, detail="No reply from agent (empty response)")
+        except OpenAIError as e:
+            last_exc = e
+            err_str = str(e)
+            logger.warning("OpenAIError on attempt %d: %s", attempt, err_str)
 
-        # write simple memory (best-effort)
-        try:
-            push_memory(convo_id, f"user: {user_text}")
-            push_memory(convo_id, f"assistant: {choice_text}")
-        except Exception as ex:
-            logger.warning("Memory write failed: %s", ex)
+            # Analyze the message to drive fallback decisions:
+            # - If the error mentions 'max_tokens' unsupported, remove any max_... token arg
+            # - If the error complains about temperature unsupported, remove or set to 1.0
+            # - Otherwise, try one fallback then abort
 
-        # return the field names matching your ReplyResponse model
-        return ReplyResponse(reply=choice_text, model=model, memory_used=bool(memory_items))
+            modified = False
+            # handle unsupported parameter: max_tokens
+            if "max_tokens" in err_str or "max_completion_tokens" in err_str:
+                if "max_completion_tokens" in base_kwargs:
+                    logger.info("Removing max_completion_tokens due to OpenAI error")
+                    base_kwargs.pop("max_completion_tokens", None)
+                    modified = True
+            # handle unsupported temperature value
+            if "temperature" in err_str and ("does not support" in err_str or "unsupported" in err_str):
+                # Some models only accept default 1.0 — try forcing 1.0
+                if "temperature" in base_kwargs and base_kwargs["temperature"] != 1.0:
+                    logger.info("Resetting temperature to 1.0 due to OpenAI error")
+                    base_kwargs["temperature"] = 1.0
+                    modified = True
+                else:
+                    # if no temperature or already 1.0, remove temperature arg
+                    base_kwargs.pop("temperature", None)
+                    modified = True
 
-    except OpenAIError as e:
-        # extract helpful diagnostic text, but avoid leaking secrets
-        err_text = getattr(e, "user_message", None) or str(e)
-        logger.exception("OpenAI call failed: %s", err_text)
-        # Return 502 with concise message so caller sees cause
-        raise HTTPException(status_code=502, detail=f"OpenAI call failed: {err_text}")
+            if not modified:
+                # If we couldn't identify a safe fallback, stop retrying
+                logger.exception("OpenAI call failed: %s", err_str)
+                break
 
-    except HTTPException:
-        # re-raise HTTPExceptions we intentionally raised above
-        raise
+            # else, loop and retry
+            logger.info("Retrying OpenAI call with modified args (attempt %d)", attempt + 1)
 
-    except Exception as e:
-        logger.exception("Unexpected error in api_reply: %s", e)
-        raise HTTPException(status_code=502, detail="Agent failed to produce reply")
+        except Exception as e:
+            # Non-OpenAI errors (network, etc.)
+            last_exc = e
+            logger.exception("Unexpected error calling OpenAI")
+            break
+
+    # If we exit loop without returning, everything failed
+    logger.exception("OpenAI call failed (all attempts). Last error: %s", str(last_exc)[:1000] if last_exc else "none")
+    raise HTTPException(status_code=502, detail="Agent failed to produce reply")
