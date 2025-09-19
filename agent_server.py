@@ -8,6 +8,10 @@ from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.responses import JSONResponse
 from openai import OpenAI
+from fastapi import HTTPException
+from openai.error import OpenAIError
+import asyncio
+import os
 
 # Optional Redis memory (requires REDIS_URL)
 redis = None
@@ -71,6 +75,8 @@ class ReplyResponse(BaseModel):
 def health():
     return {"status": "ok", "time": int(time.time())}
 
+
+
 @app.post("/api/reply", response_model=ReplyResponse)
 async def api_reply(req: ReplyRequest, request: Request, authorization: Optional[str] = Header(None)):
     if not check_auth(authorization):
@@ -90,46 +96,102 @@ async def api_reply(req: ReplyRequest, request: Request, authorization: Optional
     messages.append({"role": "user", "content": user_text})
 
     model = os.environ.get("AGENT_MODEL", "gpt-5-nano-2025-08-07")
+    max_tokens_env = os.environ.get("AGENT_MAX_TOKENS", "512")
+    try:
+        max_completion_tokens = int(max_tokens_env)
+    except Exception:
+        max_completion_tokens = 512
+
+    temperature = float(os.environ.get("AGENT_TEMPERATURE", "0.2"))
+
     try:
         # run blocking client in executor to avoid blocking event loop
         loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, lambda: openai_client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=int(os.environ.get("AGENT_MAX_TOKENS", "512")),
-            temperature=float(os.environ.get("AGENT_TEMPERATURE", "0.2")),
-        ))
+        try:
+            resp = await loop.run_in_executor(
+                None,
+                lambda: openai_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    # use the newer param name expected by modern OpenAI endpoints
+                    max_completion_tokens=max_completion_tokens,
+                    temperature=temperature,
+                ),
+            )
+        except OpenAIError as oe:
+            # If the model/SDK combination still expects `max_tokens` (rare), try fallback once
+            msg = str(oe)
+            logger.warning("OpenAIError on first attempt: %s", msg)
+            # try a fallback call without the newer param (older API)
+            try:
+                resp = await loop.run_in_executor(
+                    None,
+                    lambda: openai_client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        max_tokens=max_completion_tokens,
+                        temperature=temperature,
+                    ),
+                )
+            except OpenAIError as oe2:
+                # log both error messages for diagnosis and re-raise for outer handler
+                logger.exception("OpenAI call failed (fallback attempt also failed): %s | %s", oe, oe2)
+                raise
 
-        # extract text robustly
+        # extract text robustly from response (support dict or object shapes)
         choice_text = None
+
+        # openai-python may return resource objects or plain dicts depending on version
+        # Try common locations in order of likelihood
         if hasattr(resp, "choices") and len(resp.choices) > 0:
             choice = resp.choices[0]
+            # new-style: choice.message.content
             msg = getattr(choice, "message", None)
             if msg is not None:
                 choice_text = getattr(msg, "content", None)
-            else:
+            # older-style: choice.text
+            if not choice_text:
                 choice_text = getattr(choice, "text", None)
+            # delta streaming style
+            if not choice_text:
+                delta = getattr(choice, "delta", None)
+                if isinstance(delta, dict):
+                    choice_text = delta.get("content")
         elif isinstance(resp, dict):
             ch = resp.get("choices", [])
             if ch:
                 c0 = ch[0]
-                if "message" in c0:
-                    choice_text = c0["message"]["content"]
+                if isinstance(c0.get("message"), dict):
+                    choice_text = c0["message"].get("content")
                 else:
-                    choice_text = c0.get("text")
+                    choice_text = c0.get("text") or (c0.get("delta") or {}).get("content")
 
         if not choice_text:
-            logger.error("No reply from OpenAI: %s", str(resp)[:500])
-            raise HTTPException(status_code=502, detail="No reply from agent")
+            # Log enough of the response to debug without dumping huge payloads
+            logger.error("No reply from OpenAI. Response (truncated): %s", str(resp)[:2000])
+            raise HTTPException(status_code=502, detail="No reply from agent (empty response)")
 
-        # write simple memory
+        # write simple memory (best-effort)
         try:
             push_memory(convo_id, f"user: {user_text}")
             push_memory(convo_id, f"assistant: {choice_text}")
         except Exception as ex:
             logger.warning("Memory write failed: %s", ex)
 
+        # return the field names matching your ReplyResponse model
         return ReplyResponse(reply=choice_text, model=model, memory_used=bool(memory_items))
+
+    except OpenAIError as e:
+        # extract helpful diagnostic text, but avoid leaking secrets
+        err_text = getattr(e, "user_message", None) or str(e)
+        logger.exception("OpenAI call failed: %s", err_text)
+        # Return 502 with concise message so caller sees cause
+        raise HTTPException(status_code=502, detail=f"OpenAI call failed: {err_text}")
+
+    except HTTPException:
+        # re-raise HTTPExceptions we intentionally raised above
+        raise
+
     except Exception as e:
-        logger.exception("OpenAI call failed")
+        logger.exception("Unexpected error in api_reply: %s", e)
         raise HTTPException(status_code=502, detail="Agent failed to produce reply")
