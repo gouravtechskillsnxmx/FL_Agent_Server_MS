@@ -35,6 +35,7 @@ openai_client = OpenAI(api_key=OPENAI_KEY)
 AGENT_SECRET = os.environ.get("AGENT_KEY")  # Bearer token required if set
 
 app = FastAPI(title="Agent Server", version="0.1")
+app.include_router(router) 
 logger = logging.getLogger("agent_server")
 logging.basicConfig(level=logging.INFO)
 
@@ -220,3 +221,4 @@ async def api_reply(req: ReplyRequest, request: Request, authorization: Optional
     # If we exit loop without returning, everything failed
     logger.exception("OpenAI call failed (all attempts). Last error: %s", str(last_exc)[:1000] if last_exc else "none")
     raise HTTPException(status_code=502, detail="Agent failed to produce reply")
+
