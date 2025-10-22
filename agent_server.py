@@ -42,6 +42,17 @@ logging.basicConfig(level=logging.INFO)
 MEMORY_KEY_PREFIX = "agent:memory:"
 MAX_MEMORY_ENTRIES = int(os.environ.get("MAX_MEMORY_ENTRIES", "10"))
 
+https://fl-agent-server-ms.onrender.com/debug/ping
+
+# temporary debug endpoint — add to your main app file
+from fastapi import FastAPI
+app = app  # assume your FastAPI app is named app
+
+@app.get("/debug/ping")
+async def debug_ping():
+    return {"ok": True, "service": "agent-server-ms", "ts": __import__("time").time()}
+
+
 def get_memory(convo_id: str):
     if not redis:
         return []
@@ -222,5 +233,6 @@ async def api_reply(req: ReplyRequest, request: Request, authorization: Optional
     # If we exit loop without returning, everything failed
     logger.exception("OpenAI call failed (all attempts). Last error: %s", str(last_exc)[:1000] if last_exc else "none")
     raise HTTPException(status_code=502, detail="Agent failed to produce reply")
+
 
 
