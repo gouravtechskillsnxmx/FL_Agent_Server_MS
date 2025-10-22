@@ -85,7 +85,8 @@ def health():
 # existing helper: check_auth, get_memory, push_memory, ReplyRequest, ReplyResponse, etc.
 # make sure openai_client is instantiated earlier in the module
 
-@router.post("/api/reply", response_model=ReplyResponse)
+
+@app.post("/api/reply", response_model=ReplyResponse)
 async def api_reply(req: ReplyRequest, request: Request, authorization: Optional[str] = Header(None)):
     if not check_auth(authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -221,4 +222,5 @@ async def api_reply(req: ReplyRequest, request: Request, authorization: Optional
     # If we exit loop without returning, everything failed
     logger.exception("OpenAI call failed (all attempts). Last error: %s", str(last_exc)[:1000] if last_exc else "none")
     raise HTTPException(status_code=502, detail="Agent failed to produce reply")
+
 
