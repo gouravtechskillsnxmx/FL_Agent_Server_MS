@@ -49,8 +49,32 @@ app = app  # assume your FastAPI app is named app
 @app.get("/debug/ping")
 async def debug_ping():
     return {"ok": True, "service": "agent-server-ms", "ts": __import__("time").time()}
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
-
+# Temporary debug endpoint: accepts POSTs without auth and echoes body+headers.
+# Add this near your other @app.route handlers (e.g. after /debug/ping).
+@app.post("/debug/reply-echo")
+async def debug_reply_echo(request: Request):
+    """
+    Debug endpoint to verify that POST payloads and Authorization headers
+    are reaching the service. Safe to leave in for debugging; remove later.
+    """
+    try:
+        raw = await request.body()
+        try:
+            json_body = await request.json()
+        except Exception:
+            json_body = None
+        auth_header = request.headers.get("authorization")
+        # Log to the same logger so you can see it in Render logs
+        logger.info("DEBUG /debug/reply-echo received auth=%r json=%r raw=%r",
+                    auth_header, json_body, raw.decode("utf-8", errors="replace"))
+        return JSONResponse({"received": json_body, "raw": raw.decode("utf-8", errors="replace"),
+                             "authorization": auth_header})
+    except Exception as e:
+        logger.exception("Error in debug_reply_echo: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 def get_memory(convo_id: str):
     if not redis:
         return []
@@ -231,6 +255,7 @@ async def api_reply(req: ReplyRequest, request: Request, authorization: Optional
     # If we exit loop without returning, everything failed
     logger.exception("OpenAI call failed (all attempts). Last error: %s", str(last_exc)[:1000] if last_exc else "none")
     raise HTTPException(status_code=502, detail="Agent failed to produce reply")
+
 
 
 
